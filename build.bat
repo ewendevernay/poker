@@ -1,0 +1,1 @@
+cl gdi32.lib msvcrt.lib raylib.lib winmm.lib user32.lib shell32.lib Ws2_32.lib -MT -Gm- -nologo -Oi -GR- -EHa- -Zi -WX -W4 -wd4456 -wd4389 -wd4201 -wd4100 -wd4189 -wd4200 -wd4244 -DNDEBUG -DPOKER_WIN32 -Iraylib-5.5_win64_msvc16/include /O2 poker_win32.c /link /libpath:raylib-5.5_win64_msvc16/lib /NODEFAULTLIB:libcmt /SUBSYSTEM:WINDOWS /NODEFAULTLIB:msvcrtd -opt:ref
