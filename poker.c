@@ -3,8 +3,13 @@
 #include "poker.h"
 #include "raylib.h"
 
+#include <math.h>
 #include <time.h>
 #define CRASH(error) do { printf("%s:%d: %s\n", __FILE__, __LINE__, error); abort(); } while (0)
+
+#ifndef M_PI
+#define M_PI 3.1415f
+#endif
 
 #define DEFAULT_SERVER_PORT 6966
 
@@ -410,9 +415,9 @@ static uint32_t poker_hand_score(Card *common_cards, Card *cards) {
 #define MAX_RAISE 1000000
 
 #define MAX_PLAYERS_COUNT 1024
-#define MAX_CONNECTED_PLAYERS_COUNT 16
+#define MAX_CONNECTED_PLAYERS_COUNT 10
 #define MAX_TURNS_COUNT 16
-#define PLAYER_NAME_MAX_LEN 40
+#define PLAYER_NAME_MAX_LEN 12
 #define DISTANT_IP_MAX_LEN 64
 
 #define PLAYER_DEFAULT_BALANCE 1000
@@ -432,7 +437,6 @@ typedef enum {
  P_FOLD,
  P_RAISE,
  P_PLAYED,
- P_NEW_TURN,
  P_OVER_FORFEIT,
  P_OVER_WIN
 } PacketType;
@@ -444,7 +448,7 @@ typedef struct {
         
  int32_t balance;
  int32_t hand_balance;
-        
+ 
  Card cards[2];
  uint32_t highest_bet;
 
@@ -559,17 +563,17 @@ static uint8_t send_packet_buffer[PACKET_MAX_SIZE];
 static uint64_t client_get_packet(uint8_t *packet, uint32_t packet_size) {
  PkAddr src_addr;
  uint64_t bytes_count;
- uint64_t bytes_recieved = 0;
+ uint64_t bytes_received = 0;
 
  NBResult res = receive_packet(client_state.socket, packet, packet_size, &src_addr, &bytes_count);
  if (res == R_READY &&
      address_equal(&src_addr, &client_state.distant_server_addr) &&
      bytes_count >= PACKET_CLIENT_HEADER_SIZE)
  {
-  bytes_recieved = bytes_count;
+  bytes_received = bytes_count;
  }
 
- return bytes_recieved;
+ return bytes_received;
 }
 
 static void client_send_packet(uint8_t *packet, uint32_t packet_size) {
@@ -583,14 +587,14 @@ static void client_send_packet(uint8_t *packet, uint32_t packet_size) {
 
 static uint64_t server_get_packet(uint8_t *packet, uint32_t packet_size, PkAddr *src_addr) {
  uint64_t bytes_count;
- uint64_t bytes_recieved = 0;
+ uint64_t bytes_received = 0;
 
  NBResult res = receive_packet(server_state.socket, packet, packet_size, src_addr, &bytes_count);
  if (res == R_READY && bytes_count >= PACKET_SERVER_HEADER_SIZE) {
-  bytes_recieved = bytes_count;
+  bytes_received = bytes_count;
  }
 
- return bytes_recieved;
+ return bytes_received;
 }
 
 static void server_send_packet(PlayerID player_id, uint8_t *packet, uint32_t packet_size) {
@@ -616,15 +620,19 @@ static void server_init() {
  server_state.game_state = G_WAITING;
 }
 
-static uint32_t server_players_count(uint32_t mask) {
- uint32_t players_count = 0;
- for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
-  if ((server_state.players[p_id].flags & mask) == mask) {
-   players_count++;
+static uint32_t players_array_count(Player *players, uint32_t players_count, uint32_t mask) {
+ uint32_t count = 0;
+ for (uint32_t p_id = 1; p_id < players_count; p_id++) {
+  if ((players[p_id].flags & mask) == mask) {
+   count++;
   }
  }
 
- return players_count;
+ return count;
+}
+
+static uint32_t server_players_count(uint32_t mask) {
+ return players_array_count(server_state.players, server_state.players_count, mask);
 }
 
 static void disconnect() {
@@ -660,6 +668,7 @@ static void se_write_player(PlayerID p_id, Player *player) {
  se_write_string(player->name);
  se_write_s32(player->hand_balance);
  se_write_u32(player->flags);
+ se_write_s32(player->global_score);
 }
 
 static void se_write_server_player_order() {
@@ -710,55 +719,55 @@ static void server_next_turn(bool8_t not_increase_turn) {
   se_write_s32(last_player->hand_balance);
  } else if (!not_increase_turn) {
   bool8_t is_next_turn = false;
-
-  if (server_active_players_count() <= 1) {
-   // If there are no more players that aren't in all-in
-   is_finished = true;
-  } else {
-   Player *player = 0;
-                
+  bool8_t is_everybody_allin = false;
+  
+  Player *player = 0;
+  
+  if (server_active_players_count() > 0) {
    do { // Adavancing the current player index
     server_state.player_order_index = ((server_state.player_order_index + 1) %
                                        server_state.player_order_count);
 
-    if (server_state.player_order_index == 0) server_state.is_turn_over = 1;
+    if (server_state.player_order_index == 0) {
+     server_state.is_turn_over = 1;
+    }
 
     player = &server_state.players[server_state.player_order[server_state.player_order_index]];
    } while (!(player->flags & P_PLAYING) || (player->flags & P_ALL_IN));
+  } else {
+   is_everybody_allin = true;
+  }
                 
-   if (server_state.is_turn_over && player->highest_bet == server_state.highest_bet) {
-    // Next turn
-    is_next_turn = true;
+  if (is_everybody_allin || (server_state.is_turn_over && player->highest_bet == server_state.highest_bet)) {
+   // Next turn
+   is_next_turn = true;
 
-    server_state.is_turn_over = 0;
-    server_state.player_order_index = 0;
+   server_state.is_turn_over = 0;
+   server_state.player_order_index = 0;
 
+   server_state.highest_bet = 0;
+
+   uint32_t pot_this_turn = server_state.pot_balance;
+   for (uint32_t i = 0; i < server_state.poker_state.turn; i++) {
+    pot_this_turn -= server_state.pot_last_turns[i];
+   }
+                                
+   server_state.pot_last_turns[server_state.poker_state.turn] = pot_this_turn;
+
+   if (server_active_players_count() <= 1 || poker_draw_cards(&server_state.poker_state)) {
+    is_finished = true;
+   } else {
     Player *p = &server_state.players[server_state.player_order[server_state.player_order_index]];
     while (!(p->flags & P_PLAYING) || (p->flags & P_ALL_IN)) { // Selecting first player
      server_state.player_order_index++;
      p = &server_state.players[server_state.player_order[server_state.player_order_index]];
     }
 
-    server_state.highest_bet = 0;
-
-    uint32_t pot_this_turn = server_state.pot_balance;
-    for (uint32_t i = 0; i < server_state.poker_state.turn; i++) {
-     pot_this_turn -= server_state.pot_last_turns[i];
-    }
-                                
-    server_state.pot_last_turns[server_state.poker_state.turn] = pot_this_turn;
-
-    ba_assert(server_active_players_count() > 1);
-
-    if (poker_draw_cards(&server_state.poker_state)) {
-     is_finished = true;
-    } else {
-     // Hand not over, resetting the players' bets
-     for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
-      if (server_state.players[p_id].flags & P_PLAYING) {
-       server_state.players[p_id].highest_bet = 0;
-       server_state.players[p_id].flags &= ~P_ALL_IN_FIRST_TURN;
-      }
+    // Hand not over, resetting the players' bets
+    for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
+     if (server_state.players[p_id].flags & P_PLAYING) {
+      server_state.players[p_id].highest_bet = 0;
+      server_state.players[p_id].flags &= ~P_ALL_IN_FIRST_TURN;
      }
     }
    }
@@ -825,7 +834,7 @@ static void server_next_turn(bool8_t not_increase_turn) {
        divisor++;
       }
      }
-
+     
      if (owning_players_count > 0) {
       uint32_t amount = server_state.players[pot_id].pot_balance / divisor;
       uint32_t rest = server_state.players[pot_id].pot_balance % divisor;
@@ -846,7 +855,7 @@ static void server_next_turn(bool8_t not_increase_turn) {
     uint32_t owning_players_count = 0;
 
     for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
-     if (((server_state.players[p_id].flags & P_CONNECTED) &&
+     if (((server_state.players[p_id].flags & P_PLAYING) &&
           !(server_state.players[p_id].flags & P_ALL_IN)) ||
          ((server_state.players[p_id].flags & P_ALL_IN) &&
           server_state.players[p_id].all_in_turn > turn))
@@ -877,6 +886,24 @@ static void server_next_turn(bool8_t not_increase_turn) {
     }
    }
 
+   bool8_t is_player_dead = false;
+
+   for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
+    Player *p = &server_state.players[p_id];
+    if (p->hand_balance == 0) {
+     is_player_dead = true;
+     break;
+    }
+   }
+
+   if (is_player_dead) {
+    for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
+     Player *p = &server_state.players[p_id];
+
+     if (p->flags & P_EXISTS) p->global_score += (p->hand_balance - PLAYER_DEFAULT_BALANCE);
+    }
+   }
+
    se_write_u8(P_OVER_WIN);
 
    uint32_t last_players_count = 0;
@@ -889,14 +916,17 @@ static void server_next_turn(bool8_t not_increase_turn) {
    se_write_u32(last_players_count);
                         
    for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
-    if (server_state.players[p_id].flags & (P_PLAYING | P_ALL_IN)) {
+    Player *p = &server_state.players[p_id];
+
+    if (p->flags & (P_PLAYING | P_ALL_IN)) {
      se_write_u32(p_id);
-     se_write_s32(server_state.players[p_id].hand_balance);
-     se_write_s32(server_state.players[p_id].balance);
+     se_write_u32(p->flags);
+     se_write_s32(p->hand_balance);
+     se_write_s32(p->balance);
 
      for (uint32_t j = 0; j < 2; j++) {
-      se_write_u8(server_state.players[p_id].cards[j].color);
-      se_write_u8(server_state.players[p_id].cards[j].number);
+      se_write_u8(p->cards[j].color);
+      se_write_u8(p->cards[j].number);
      }
     }
    }
@@ -910,6 +940,27 @@ static void server_next_turn(bool8_t not_increase_turn) {
    } else {
     se_write_u8(0);
    }
+
+   // Reset the game if dead
+   if (is_player_dead) {
+    se_write_u8(1);
+    
+    se_write_u32(server_players_count(P_EXISTS));
+    
+    for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
+     Player *p = &server_state.players[p_id];
+
+     if (p->flags & P_EXISTS) {
+      se_write_u32(p_id);
+      se_write_s32(p->global_score);
+      
+      p->hand_balance = PLAYER_DEFAULT_BALANCE;
+     }
+    }
+
+   } else {
+    se_write_u8(0);
+   }
   } else {                      
    Player *player = &server_state.players[player_id];
 
@@ -920,6 +971,7 @@ static void server_next_turn(bool8_t not_increase_turn) {
 
    se_write_u32(player_id);
    se_write_s32(player->hand_balance);
+   se_write_u32(player->highest_bet);
    se_write_u32(player->flags);
 
    uint32_t all_in_count = server_players_count(P_ALL_IN);
@@ -943,46 +995,6 @@ static void server_next_turn(bool8_t not_increase_turn) {
     se_write_u32(0);
    }
   }               
- }
-
- bool8_t is_player_dead = false;
- 
- // Check for dead player
- if (is_finished) {
-  for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
-   Player *p = &server_state.players[p_id];
-   if (p->hand_balance == 0) {
-    is_player_dead = true;
-    break;
-   }
-  }
-
-  // Reset the game if dead
-  if (is_player_dead) {
-   for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
-    Player *p = &server_state.players[p_id];
-
-    if (p->flags & P_EXISTS) {
-     p->global_score += (p->hand_balance - PLAYER_DEFAULT_BALANCE);
-     p->hand_balance = PLAYER_DEFAULT_BALANCE;
-    }
-   }
-
-   se_write_u8(1);
-
-   se_write_u32(server_players_count(P_EXISTS));
-
-   for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
-    Player *p = &server_state.players[p_id];
-    
-    if (p->flags & P_EXISTS) {
-     se_write_u32(p_id);
-     se_write_s32(p->global_score);
-    }
-   }
-  } else {
-   se_write_u8(0);
-  }
  }
 
  uint64_t packet_size = 0;
@@ -1250,9 +1262,14 @@ static void server_update() {
       }
 
       Player *blind = &server_state.players[server_state.player_order[server_state.player_order_count - 1]];
-      blind->hand_balance -= BLIND_PRICE;
-      server_state.pot_balance = BLIND_PRICE;
-      server_state.highest_bet = BLIND_PRICE;
+      if (blind->hand_balance > BLIND_PRICE) {
+       blind->hand_balance -= BLIND_PRICE;
+       server_state.pot_balance = BLIND_PRICE;
+       server_state.highest_bet = BLIND_PRICE;
+      } else {
+       server_state.pot_balance = 0;
+       server_state.highest_bet = 0;      
+      }
      }
 
      for (uint32_t p_id = 1; p_id < server_state.players_count; p_id++) {
@@ -1303,7 +1320,7 @@ static void server_update() {
    }
   } break;
   default: {
-   printf("[Server] Recieved unkown packet!\n");
+   printf("[Server] Received unkown packet!\n");
   } break;
   }
 
@@ -1350,6 +1367,8 @@ static void se_read_client_players(uint32_t players_count) {
   uint32_t flags = 0;
   se_read_u32(&flags);
   client_state.players[player_id].flags = flags;
+
+  se_read_s32(&client_state.players[player_id].global_score);
  }
 }
 
@@ -1358,7 +1377,7 @@ static void client_send_call() {
 
  se_write_u8(P_CALL);
  se_write_u32(client_state.player_id);
-
+ 
  uint64_t packet_size;
  se_end(&packet_size);
 
@@ -1404,23 +1423,50 @@ static void client_reset() {
 }
 
 #define ITEMS_TEXT_HEIGHT 43
+#define NAMETAG_TEXT_HEIGHT 30
 
 static Font gui_font;
+static Font small_font;
 
 static String *menu_selected_input;
 static uint32_t menu_element_position;
 static uint32_t menu_element_padding;
 static uint32_t menu_element_top_margin;
 static uint32_t menu_input_frames;
+static int menu_frame_x;
+static int menu_frame_y;
+static int menu_frame_width;
+static int menu_frame_height;
+static Color menu_color;
 
 static void menu_begin() {
  menu_selected_input = 0;
  menu_element_position = 0;
  menu_element_padding = 120;
  menu_element_top_margin = 150;
+
+ menu_frame_x = 0;
+ menu_frame_y = 0;
+ menu_frame_width = screen_width;
+ menu_frame_height = screen_height;
+
+ menu_color = (Color) { 0xff, 0xff, 0xff, 0xff };
+}
+
+static void menu_begin_framed(int x, int y, int width, int height) {
+ menu_begin();
+ 
+ menu_frame_x = x;
+ menu_frame_y = y;
+ menu_frame_width = width;
+ menu_frame_height = height;
 }
 
 static void menu_end() {}
+
+static void menu_set_color(Color color) {
+ menu_color = color;
+}
 
 static void menu_set_padding(uint32_t padding) {
  menu_element_padding = padding;
@@ -1430,14 +1476,14 @@ static void menu_set_top_margin(uint32_t top_margin) {
  menu_element_top_margin = top_margin;
 }
 
-static void menu_label(char *text, Color color) {
+static void menu_label(char *text) {
  Vector2 text_dims = MeasureTextEx(gui_font, text, ITEMS_TEXT_HEIGHT, 2);
  float text_width = text_dims.x;
 
- int text_x = screen_width / 2 - text_width / 2;
- int text_y = screen_height / 12 + menu_element_top_margin + menu_element_padding * menu_element_position;
+ int text_x = menu_frame_x + menu_frame_width / 2 - text_width / 2;
+ int text_y = menu_frame_y + menu_frame_height / 12 + menu_element_top_margin + menu_element_padding * menu_element_position;
 
- DrawTextEx(gui_font, text, (Vector2){ text_x, text_y }, ITEMS_TEXT_HEIGHT, 2, color);
+ DrawTextEx(gui_font, text, (Vector2){ text_x, text_y }, ITEMS_TEXT_HEIGHT, 2, menu_color);
 
  menu_element_position++;
 }
@@ -1445,14 +1491,27 @@ static void menu_label(char *text, Color color) {
 static bool8_t menu_button(char *text) {
  Vector2 text_dims = MeasureTextEx(gui_font, text, ITEMS_TEXT_HEIGHT, 2);
  float text_width = text_dims.x;
+ float text_height = text_dims.y;
 
- int text_x = screen_width / 2 - text_width / 2;
- int text_y = screen_height / 12 + menu_element_top_margin + menu_element_padding * menu_element_position;
+ int text_x = menu_frame_x + menu_frame_width / 2 - text_width / 2;
+ int text_y = menu_frame_y + menu_frame_height / 12 + menu_element_top_margin + menu_element_padding * menu_element_position;
 
  bool8_t is_hovered = (mouse_x >= text_x && mouse_x <= text_x + text_width &&
                        mouse_y >= text_y && mouse_y <= text_y + ITEMS_TEXT_HEIGHT);
 
- DrawTextEx(gui_font, text, (Vector2){ text_x, text_y }, ITEMS_TEXT_HEIGHT, 2, is_hovered ? RED : BLACK);
+#define BUTTON_MARGIN_X 10
+#define BUTTON_MARGIN_Y 2
+
+ Rectangle button_background_rec = {
+  .x = text_x - BUTTON_MARGIN_X,
+  .y = text_y - BUTTON_MARGIN_Y,
+  .width = text_width + BUTTON_MARGIN_X * 2,
+  .height = text_height + BUTTON_MARGIN_Y * 2,
+ };
+ 
+ DrawRectangleRounded(button_background_rec, 0.5f, 20, is_hovered ? BLACK : WHITE);
+ 
+ DrawTextEx(gui_font, text, (Vector2){ text_x, text_y }, ITEMS_TEXT_HEIGHT, 2, is_hovered ? WHITE : BLACK);
  menu_element_position++;
 
  return is_hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
@@ -1463,7 +1522,7 @@ static bool8_t menu_button(char *text) {
 static void menu_input(String *value, uint32_t max_size) {
  if (menu_selected_input == 0) { menu_selected_input = value; }
 
- int input_y = screen_height / 12 + menu_element_top_margin + menu_element_padding * menu_element_position;
+ int input_y = menu_frame_y + menu_frame_height / 12 + menu_element_top_margin + menu_element_padding * menu_element_position;
 
  if (mouse_y >= input_y && mouse_y <= input_y + ITEMS_TEXT_HEIGHT) { menu_selected_input = value; }
 
@@ -1472,9 +1531,9 @@ static void menu_input(String *value, uint32_t max_size) {
  Vector2 text_dims = MeasureTextEx(gui_font, value_cstr, ITEMS_TEXT_HEIGHT, 2);
  float text_width = text_dims.x;
 
- float text_x = screen_width / 2 - text_width / 2;
+ float text_x = menu_frame_x + menu_frame_width / 2 - text_width / 2;
 
- DrawTextEx(gui_font, value_cstr, (Vector2){ text_x, input_y }, ITEMS_TEXT_HEIGHT, 2, DARKGRAY);
+ DrawTextEx(gui_font, value_cstr, (Vector2){ text_x, input_y }, ITEMS_TEXT_HEIGHT, 2, menu_color);
 
  if (menu_selected_input == value) {
   int key;
@@ -1489,7 +1548,7 @@ static void menu_input(String *value, uint32_t max_size) {
   }
 
   if (menu_input_frames % INPUT_BLINK_PERIOD < (INPUT_BLINK_PERIOD / 2)) {
-   DrawRectangle(text_x + text_width + 2, input_y, 2, ITEMS_TEXT_HEIGHT, DARKGRAY);
+   DrawRectangle(text_x + text_width + 2, input_y, 2, ITEMS_TEXT_HEIGHT, menu_color);
   }
  }
 
@@ -1509,26 +1568,21 @@ enum {
 
 #define ALLOCATED_MEMORY_SIZE Megabytes(5)
 
-#define CARD_WIDTH 350
-#define CARD_HEIGHT 490
+#define CARD_WIDTH (500 * 5 / 7)
+#define CARD_HEIGHT 500
 
-static Texture2D main_menu_background_texture;
 static Texture2D cards_texture;
+static Texture2D background_texture;
 
-static void draw_menu_background() {
- DrawTexture(main_menu_background_texture,
-             screen_width - main_menu_background_texture.width,
-             screen_height - main_menu_background_texture.height,
-             WHITE);
-
- DrawTexture(main_menu_background_texture,
-             0,
-             screen_height - main_menu_background_texture.height,
-             WHITE);
+static void draw_background() {
+ DrawTexture(background_texture,
+             screen_width / 2 - background_texture.width / 2,
+             screen_height / 2 - background_texture.height / 2,
+             (Color) { 0xff, 0xff, 0xff, 0xff });
 }
 
 static void draw_card(Card card, int x, int y, int width) {
- int src_x = CARD_WIDTH * (card.number - 1);
+ int src_x = CARD_WIDTH * card.number;
  int src_y = CARD_HEIGHT * card.color;
         
  Rectangle source = { src_x, src_y, CARD_WIDTH, CARD_HEIGHT };
@@ -1537,31 +1591,54 @@ static void draw_card(Card card, int x, int y, int width) {
  DrawTexturePro(cards_texture, source, dest, (Vector2){ 0, 0 }, 0.f, WHITE);
 }
 
-static void menu_label_player(Player *player, Color color) {
- char *cstr;
- if (player->flags & P_ALL_IN) {
-  cstr = tprintf(&frame_pool, STR_FMT_LIT": %d (pot: %u)",
-                 STR_FMT(player->name),
-                 player->hand_balance, player->pot_balance);
- } else {
-  cstr = tprintf(&frame_pool, STR_FMT_LIT": %d",
-                 STR_FMT(player->name),
-                 player->hand_balance);
- }
-        
- menu_label(cstr, color);
-}
-
 #define NUMBER_INPUT_MAX_SIZE 16
 
+static void draw_info(int pos_x, int pos_y, char *info_text) {
+ Vector2 info_text_dims = MeasureTextEx(gui_font, info_text, ITEMS_TEXT_HEIGHT, 2);
+       
+#define INFO_PADDING_X 5
+       
+ DrawRectangle(pos_x - info_text_dims.x / 2 - INFO_PADDING_X,
+               pos_y - info_text_dims.y / 2,
+               info_text_dims.x + INFO_PADDING_X * 2,
+               info_text_dims.y,
+               BLACK);
+
+ DrawTextEx(gui_font, info_text,
+            (Vector2){
+             pos_x - info_text_dims.x / 2,
+             pos_y - info_text_dims.y / 2
+            }, ITEMS_TEXT_HEIGHT, 2, WHITE);
+}
+/*
+FILE *save_file;
+
+void restore_state() {
+ pool_temp_begin(&frame_pool);
+ 
+ fseek(file, 0, SEEK_END);
+
+ long size = ftell(file);
+
+ rewind(file);
+
+ if (size > 0) {
+  uint8_t *file_data = fread();
+ }
+
+ pool_temp_end(&frame_pool);
+}
+*/
 static void poker_main(int argc, char **argv) {
  if (!initialize_networking()) {
   CRASH("Network initalization");
  }
 
  void *mem = allocate_pages(ALLOCATED_MEMORY_SIZE);
- if (mem == 0) { CRASH("Not enough memory!\n"); }
-
+ if (mem == 0) {
+  CRASH("Not enough memory!\n");
+ }
+ 
  pool_init(&main_pool, mem, ALLOCATED_MEMORY_SIZE);
  frame_pool = pool_subpool(&main_pool, ALLOCATED_MEMORY_SIZE / 2);
 
@@ -1578,16 +1655,34 @@ static void poker_main(int argc, char **argv) {
 
  // xorshift_seed(time(0));
  srand(time(0));
-        
+/*
+ save_file = fopen("save.dat", "w+");
+ if (save_file == 0) {
+  CRASH("Failed to create save file!\n");
+ }
+
+ restore_state();
+*/ 
+ SetConfigFlags(FLAG_WINDOW_RESIZABLE);
  InitWindow(screen_width, screen_height, "Poker");
-
- gui_font = LoadFontEx("garamond.ttf", ITEMS_TEXT_HEIGHT, 0, 250);
- Image main_menu_background = LoadImage("chips_resized.png");
-
- Image cards_image = LoadImage("cards.png");
 
  SetTargetFPS(60);
 
+ // Loading resources
+ gui_font = LoadFontEx("garamond.ttf", ITEMS_TEXT_HEIGHT, 0, 250);
+ small_font = LoadFontEx("garamond.ttf", NAMETAG_TEXT_HEIGHT, 0, 250);
+ 
+ Image cards_image = LoadImage("cards.png");
+ Image background_image = LoadImage("background.png");
+
+ cards_texture = LoadTextureFromImage(cards_image);
+ UnloadImage(cards_image);
+
+ SetTextureFilter(cards_texture, TEXTURE_FILTER_BILINEAR); 
+
+ background_texture = LoadTextureFromImage(background_image);
+ UnloadImage(background_image);
+ 
  bool8_t should_close = false;
 
  gui_state = GUI_USERNAME_MENU;
@@ -1595,12 +1690,6 @@ static void poker_main(int argc, char **argv) {
  Color background_color = {
   0xf7, 0xf7, 0xf7, 0xff
  };
-
- main_menu_background_texture = LoadTextureFromImage(main_menu_background);
- cards_texture = LoadTextureFromImage(cards_image);
-
- UnloadImage(main_menu_background);
- UnloadImage(cards_image);
 
  String distant_ip_address = {};
  distant_ip_address.data = pool_alloc(&main_pool, DISTANT_IP_MAX_LEN);
@@ -1612,6 +1701,11 @@ static void poker_main(int argc, char **argv) {
   mouse_x = GetMouseX();
   mouse_y = GetMouseY();
 
+  if (IsWindowResized()) {
+   screen_width = GetScreenWidth();
+   screen_height = GetScreenHeight();
+  }
+  
   BeginDrawing();
   ClearBackground(background_color);
   EndDrawing();
@@ -1620,8 +1714,8 @@ static void poker_main(int argc, char **argv) {
 
   switch (gui_state) {
   case GUI_MAIN_MENU: {
-   draw_menu_background();
-
+   draw_background();
+   
    menu_begin();
 
    if (menu_button("Create local server")) {
@@ -1653,30 +1747,32 @@ static void poker_main(int argc, char **argv) {
    menu_end();
   } break;
   case GUI_USERNAME_MENU: {
-   draw_menu_background();
+   draw_background();
 
    menu_begin();
    menu_set_padding(80);
 
-   menu_label("Choose your username", BLACK);
+   menu_label("Choose your username");
 
    menu_input(&client_state.username, PLAYER_NAME_MAX_LEN);
 
-   if (menu_button("OK")) gui_state = GUI_MAIN_MENU;
+   if (menu_button("OK") || IsKeyPressed(KEY_ENTER)) {
+    gui_state = GUI_MAIN_MENU;
+   }
 
    menu_end();
   } break;
   case GUI_CONNECT_MENU: {
-   draw_menu_background();
+   draw_background();
    menu_set_padding(80);
 
    menu_begin();
 
-   menu_label("Server IP", BLACK);
+   menu_label("Server IP");
 
    menu_input(&distant_ip_address, DISTANT_IP_MAX_LEN);
 
-   if (menu_button("Connect")) {
+   if (menu_button("Connect") || IsKeyPressed(KEY_ENTER)) {
     uint8_t ip_address[4];
     if (parse_ipv4(distant_ip_address, ip_address)) {
      memcpy(client_state.distant_server_addr.ip, ip_address, sizeof (ip_address));
@@ -1789,10 +1885,15 @@ static void poker_main(int argc, char **argv) {
      client_state.player_order_index = 0;
 
      Player *blind = &client_state.players[client_state.player_order[client_state.player_order_count - 1]];
-     blind->hand_balance -= BLIND_PRICE;
+     if (blind->hand_balance > BLIND_PRICE) {
+      blind->hand_balance -= BLIND_PRICE;
 
-     client_state.pot_balance = BLIND_PRICE;
-     client_state.highest_bet = BLIND_PRICE;
+      client_state.pot_balance = BLIND_PRICE;
+      client_state.highest_bet = BLIND_PRICE;
+     } else {
+      server_state.pot_balance = 0;
+      server_state.highest_bet = 0;
+     }
 
      for (uint32_t p_id = 1; p_id < client_state.players_count; p_id++) {
       Player *player = &client_state.players[p_id];
@@ -1814,6 +1915,7 @@ static void poker_main(int argc, char **argv) {
       uint32_t player_id;
       se_read_u32(&player_id);
       se_read_s32(&client_state.players[player_id].hand_balance);
+      se_read_u32(&client_state.players[player_id].highest_bet);
       se_read_u32((uint32_t*)&client_state.players[player_id].flags);
 
       uint32_t all_in_count = 0;
@@ -1823,7 +1925,7 @@ static void poker_main(int argc, char **argv) {
        se_read_u32(&p_id);
        se_read_u32(&client_state.players[p_id].pot_balance);
       }
-                                                
+
       uint32_t common_cards_count;
       se_read_u32(&common_cards_count);
 
@@ -1839,6 +1941,12 @@ static void poker_main(int argc, char **argv) {
         client_state.common_cards[i].color = color;
         client_state.common_cards[i].number = number;
        }
+
+       for (uint32_t p_id = 1; p_id < client_state.players_count; p_id++) {
+        if (client_state.players[p_id].flags & P_PLAYING) {
+         client_state.players[p_id].highest_bet = 0;
+        }
+       }
       }
 
       if (player_id == client_state.player_id &&
@@ -1848,62 +1956,68 @@ static void poker_main(int argc, char **argv) {
       }
      }
     } break;
-    case P_OVER_WIN:
     case P_OVER_FORFEIT: {
-     if (packet_type == P_OVER_FORFEIT) {
-      se_read_u32(&client_state.winning_player_id);
-      se_read_s32(&client_state.players[client_state.winning_player_id].hand_balance);
-                                                        
-      client_state.state = CLIENT_STATE_GAME_OVER_FORFEIT;
-     } else {
-      uint32_t sorted_players_count = 0;
-      se_read_u32(&sorted_players_count);
+     se_read_u32(&client_state.winning_player_id);
+     se_read_s32(&client_state.players[client_state.winning_player_id].hand_balance);
+                                                       
+     client_state.state = CLIENT_STATE_GAME_OVER_FORFEIT;
+    } break;
+    case P_OVER_WIN: {
+     uint32_t sorted_players_count = 0;
+     se_read_u32(&sorted_players_count);
 
-      client_state.winning_players_count = 0;
-      for (uint32_t i = 0; i < sorted_players_count; i++) {
-       uint32_t p_id = 0;
-       se_read_u32(&p_id);
-
-       client_state.winning_players_ids[client_state.winning_players_count] = p_id;
-       client_state.winning_players_count++;
-
-       se_read_s32(&client_state.players[p_id].hand_balance);
-       se_read_s32(&client_state.players[p_id].balance);
-                                                                 
-       for (uint32_t j = 0; j < 2; j++) {
-        se_read_u8((uint8_t*)&client_state.players[p_id].cards[j].color);
-        se_read_u8((uint8_t*)&client_state.players[p_id].cards[j].number);
-       }
+     client_state.winning_players_count = 0;
+     for (uint32_t p_id = 1; p_id < client_state.players_count; p_id++) {
+      if (client_state.players[p_id].flags & P_EXISTS) {
+       client_state.players[p_id].flags &= ~P_PLAYING;
       }
+     }
 
-      uint8_t cards_updated = 0;
-      se_read_u8(&cards_updated);
+     for (uint32_t i = 0; i < sorted_players_count; i++) {
+      uint32_t p_id = 0;
+      se_read_u32(&p_id);
 
-      if (cards_updated) {
-       for (uint32_t i = 0; i < 3 + 1 + 1; i++) {
-        se_read_u8((uint8_t*)&client_state.common_cards[i].color);
-        se_read_u8((uint8_t*)&client_state.common_cards[i].number);
-       }
+      client_state.winning_players_ids[client_state.winning_players_count] = p_id;
+      client_state.winning_players_count++;
+
+      se_read_u32((uint32_t*)&client_state.players[p_id].flags);
+      se_read_s32(&client_state.players[p_id].hand_balance);
+      se_read_s32(&client_state.players[p_id].balance);
+                                                                
+      for (uint32_t j = 0; j < 2; j++) {
+       se_read_u8((uint8_t*)&client_state.players[p_id].cards[j].color);
+       se_read_u8((uint8_t*)&client_state.players[p_id].cards[j].number);
       }
-                                                         
-      client_state.state = CLIENT_STATE_GAME_OVER_WIN;
+     }
+
+     uint8_t cards_updated = 0;
+     se_read_u8(&cards_updated);
+
+     if (cards_updated) {
+      for (uint32_t i = 0; i < 3 + 1 + 1; i++) {
+       se_read_u8((uint8_t*)&client_state.common_cards[i].color);
+       se_read_u8((uint8_t*)&client_state.common_cards[i].number);
+      }
      }
 
      bool8_t is_player_dead = false;
      se_read_u8(&is_player_dead);
 
      if (is_player_dead) {
-      uint32_t players_count = 0;
-      se_read_u32(&players_count);
-
-      for (uint32_t i = 0; i < players_count; i++) {
-       uint32_t player_id = 0;
-       se_read_u32(&player_id);
-       se_read_s32(&client_state.players[player_id].global_score);
-      }
-
       client_state.flags |= CLIENT_PLAYER_DEAD;
+
+      uint32_t existing_players = 0;
+      se_read_u32(&existing_players);
+      
+      for (uint32_t i = 0; i < existing_players; i++) {
+       uint32_t p_id = 0;
+       se_read_u32(&p_id);
+
+       se_read_s32(&client_state.players[p_id].global_score);
+      }
      }
+
+     client_state.state = CLIENT_STATE_GAME_OVER_WIN;
     } break;
     }
 
@@ -1911,22 +2025,24 @@ static void poker_main(int argc, char **argv) {
     if (!success) { CRASH("Failed to encode message!"); }
    }
 
+   draw_background();
+   
    switch (client_state.state) {
    case CLIENT_STATE_WAITING: {
     menu_begin();
     menu_set_padding(50);
 
-    menu_label("Waiting for players:", BLUE);
+    menu_label("Waiting for players:");
 
     for (uint32_t i = 0; i < client_state.players_count; i++) {
      if (client_state.players[i].flags & P_CONNECTED) {
-      menu_label(string_to_cstr(&frame_pool, client_state.players[i].name), GRAY);
+      menu_label(string_to_cstr(&frame_pool, client_state.players[i].name));
      }
     }
 
     uint32_t connected_players_count = server_players_count(P_CONNECTED);
     if (server_state.socket != 0 && connected_players_count >= 2) {
-     if (menu_button("Start game")) {
+     if (menu_button("Start game") || IsKeyPressed(KEY_ENTER)) {
       uint8_t packet = P_START;
       client_send_packet(&packet, 1);
      }
@@ -1940,138 +2056,291 @@ static void poker_main(int argc, char **argv) {
     menu_end();
    } break;
    case CLIENT_STATE_PLAYING:
-   case CLIENT_STATE_WATCHING: {
-    menu_begin();
+   case CLIENT_STATE_WATCHING:
+   case CLIENT_STATE_GAME_OVER_WIN: {
+    uint32_t shown_cards_count = client_state.state == CLIENT_STATE_GAME_OVER_WIN ? 5 : client_state.common_cards_count;
 
-    menu_set_padding(50);
-    menu_set_top_margin(10);
+#define COMMON_CARDS_PADDING 10
+#define COMMON_CARDS_SHOWN_WIDTH 100
+#define COMMON_CARD_SHOWN_HEIGHT (COMMON_CARDS_SHOWN_WIDTH * 7) / 5
 
+    int common_cards_width = 5 * (COMMON_CARDS_SHOWN_WIDTH + COMMON_CARDS_PADDING);
+     
+    int common_cards_x = screen_width / 2 - common_cards_width / 2;
+    int common_cards_y = screen_height / 2 - COMMON_CARD_SHOWN_HEIGHT / 2;
+    
+    for (uint32_t i = 0; i < shown_cards_count; i++) {
+     draw_card(client_state.common_cards[i],
+               common_cards_x + i * (COMMON_CARDS_SHOWN_WIDTH + COMMON_CARDS_PADDING),
+               common_cards_y,
+               COMMON_CARDS_SHOWN_WIDTH);
+    }
+
+    uint32_t playing_players_count = 0;
     for (uint32_t i = 0; i < client_state.player_order_count; i++) {
-     uint32_t p_id = client_state.player_order[i];
-     Player *player = &client_state.players[p_id];
-     if (player->flags & P_CONNECTED && player->flags & P_PLAYING) {
-      menu_label_player(player, i == client_state.player_order_index ? RED : BLUE);
+     if (client_state.players[client_state.player_order[i]].flags & P_CONNECTED) {
+      playing_players_count++;
      }
     }
 
-    for (uint32_t p_id = 1; p_id < client_state.players_count; p_id++) {
+    uint32_t player_id_index = 0;
+    for (uint32_t i = 0; i < client_state.player_order_count; i++) {
+     if (client_state.player_order[i] == client_state.player_id) {
+      player_id_index = i;
+      break;
+     }
+    }
+    
+    for (uint32_t i = 0; i < client_state.player_order_count; i++) {
+     uint32_t order_i = (i + player_id_index) % client_state.player_order_count;
+     uint32_t p_id = client_state.player_order[order_i];
      Player *player = &client_state.players[p_id];
-     if (player->flags & P_CONNECTED && !(player->flags & P_PLAYING)) {
-      menu_label_player(player, LIGHTGRAY);
+     
+     if (player->flags & P_CONNECTED) {
+#define CARDS_PADDING 10
+#define CARDS_SHOWN_WIDTH 100
+#define CARDS_SHOWN_HEIGHT (CARDS_SHOWN_WIDTH * 7) / 5
+#define CARDS_ANGLE_OFFSET (M_PI / 2.f)
+      
+      float cards_radius = screen_width * 3.f / 8.f;
+      
+      int pos_x = screen_width / 2 + cards_radius * cosf(2.f * M_PI * (float)i / (float)playing_players_count + CARDS_ANGLE_OFFSET);
+      int pos_y = screen_height / 2 + (cards_radius * screen_height / screen_width) * sinf(2.f * M_PI * (float)i / (float)playing_players_count + CARDS_ANGLE_OFFSET) + 25;
+
+      int cards_width = (CARDS_SHOWN_WIDTH * 2 + CARDS_PADDING);
+      int upper_corner_x = pos_x - cards_width / 2;
+      int upper_corner_y = pos_y - CARDS_SHOWN_HEIGHT / 2;
+      
+      char *name_text = string_to_cstr(&frame_pool, client_state.players[p_id].name);
+      Vector2 name_text_dims = MeasureTextEx(gui_font, name_text, NAMETAG_TEXT_HEIGHT, 2);
+
+      char *score_text = tprintf(&frame_pool, "%d", client_state.players[p_id].hand_balance);
+      Vector2 score_text_dims = MeasureTextEx(small_font, score_text, NAMETAG_TEXT_HEIGHT, 2);
+
+      int upper_y_margin = name_text_dims.y + 5;
+
+      Rectangle rect = {
+       upper_corner_x - 10,
+       upper_corner_y - upper_y_margin,
+       cards_width + 20,
+       CARDS_SHOWN_HEIGHT + upper_y_margin + 10
+      };
+
+      Color background_color;
+      if (order_i == client_state.player_order_index && client_state.state != CLIENT_STATE_GAME_OVER_WIN) {
+       background_color = (Color) { 0, 0, 0, 0xff };
+      } else {
+       background_color = (Color) { 0, 0, 0, 80 };
+      }
+      
+      DrawRectangleRounded(rect, 0.2f, 10, background_color);
+
+      DrawTextEx(small_font, name_text,
+                 (Vector2){
+                  pos_x - cards_width / 2,
+                  pos_y - upper_y_margin - CARDS_SHOWN_HEIGHT / 2
+                 }, NAMETAG_TEXT_HEIGHT, 2, WHITE);
+
+      DrawTextEx(small_font, score_text,
+                 (Vector2){
+                  pos_x + cards_width / 2 - score_text_dims.x,
+                  pos_y - upper_y_margin - CARDS_SHOWN_HEIGHT / 2
+                 }, NAMETAG_TEXT_HEIGHT, 2, WHITE);
+
+      for (uint32_t j = 0; j < 2; j++) {
+       Card to_draw = {};
+       
+       if (p_id == client_state.player_id || client_state.state == CLIENT_STATE_GAME_OVER_WIN) {
+        to_draw = player->cards[j];
+       }
+       
+       draw_card(to_draw,
+                 upper_corner_x + (CARDS_SHOWN_WIDTH + CARDS_PADDING) * j,
+                 upper_corner_y, CARDS_SHOWN_WIDTH);
+      }
+
+      if ((player->flags & P_ALL_IN) && client_state.state != CLIENT_STATE_GAME_OVER_WIN) {
+       draw_info(pos_x, pos_y, tprintf(&frame_pool, "Pot: %d", player->pot_balance));
+      }
+
+      if (!(player->flags & P_ALL_IN) && !(player->flags & P_PLAYING)) {
+       draw_info(pos_x, pos_y, "FOLD");
+      }
+
+      if (player->flags & P_PLAYING) {
+       int32_t delta = player->hand_balance - player->balance;
+      
+       if (delta != 0 && client_state.state == CLIENT_STATE_GAME_OVER_WIN) {
+        char *added_text = tprintf(&frame_pool, "%s%d\n", delta > 0 ? "+" : "", delta);
+        Vector2 added_text_dims = MeasureTextEx(small_font, added_text, NAMETAG_TEXT_HEIGHT, 2);
+
+        DrawTextEx(small_font, added_text,
+                   (Vector2){
+                    pos_x + cards_width / 2 - added_text_dims.x,
+                    pos_y - upper_y_margin - CARDS_SHOWN_HEIGHT / 2 - NAMETAG_TEXT_HEIGHT
+                   }, NAMETAG_TEXT_HEIGHT, 2, delta > 0 ? GREEN : RED);
+       }
+      }
      }
     }
 
-    menu_label(tprintf(&frame_pool, "Highest bet: %d",
-                       client_state.highest_bet), BLACK);
+    if (client_state.state == CLIENT_STATE_GAME_OVER_WIN) {
+     menu_begin();
 
-    menu_label(tprintf(&frame_pool, "Pot balance: %d",
-                       client_state.pot_balance), BLACK);
+     menu_set_color((Color) { 0, 0, 0, 0xff });
+     
+     if (menu_button("Play Again") || IsKeyPressed(KEY_ENTER)) {
+      client_reset();
+     }
+     
+     if (client_state.flags & CLIENT_PLAYER_DEAD) {
+      menu_label("Player died, resetting balances!");
+     }
+     
+     menu_end();
+    } else {
+     // Highest bet / Pot
+     
+     char *highest_bet_text = tprintf(&frame_pool, "Highest bet: %d", client_state.highest_bet);
+     char *pot_balance_text = tprintf(&frame_pool, "Pot balance: %d", client_state.pot_balance);
 
-    for (uint32_t i = 0; i < client_state.common_cards_count; i++) {
-     menu_label(tprintf(&frame_pool, "%d %d",
-                        client_state.common_cards[i].color,
-                        client_state.common_cards[i].number), BLACK);
-    }
+     Vector2 highest_bet_dims = MeasureTextEx(gui_font, highest_bet_text, ITEMS_TEXT_HEIGHT, 2);
 
-    if (client_state.state == CLIENT_STATE_PLAYING) {
-     Card *cards = client_state.players[client_state.player_id].cards;
+     DrawTextEx(gui_font, highest_bet_text,
+                (Vector2){
+                 common_cards_x,
+                 common_cards_y - highest_bet_dims.y - 10
+                }, ITEMS_TEXT_HEIGHT, 2, WHITE);
 
-     menu_label(tprintf(&frame_pool, "%d %d | %d %d",
-                        cards[0].color, cards[0].number,
-                        cards[1].color, cards[1].number), BLACK);
+     Vector2 pot_balance_dims = MeasureTextEx(gui_font, pot_balance_text, ITEMS_TEXT_HEIGHT, 2);
 
-     if (client_state.player_order[client_state.player_order_index] == client_state.player_id) {
-      if (menu_button("Call")) { client_send_call(); }
-      if (menu_button("Fold")) { client_send_fold(); }
+     DrawTextEx(gui_font, pot_balance_text,
+                (Vector2){
+                 common_cards_x + common_cards_width - pot_balance_dims.x,
+                 common_cards_y - pot_balance_dims.y - 10
+                }, ITEMS_TEXT_HEIGHT, 2, WHITE);
 
-      menu_input(&raised_value_string, NUMBER_INPUT_MAX_SIZE);
+     // Actions menu
+     
+     int frame_width = 400;
+     int frame_height = 400;
+     
+     menu_begin_framed(screen_width - frame_width, screen_height - frame_height,
+                       frame_width, frame_height);
 
-      if (menu_button("Raise")) {
-       int64_t raise_value;
-       if (string_to_int(raised_value_string, &raise_value) &&
-           raise_value > 0 && raise_value <= MAX_RAISE)
-       {
-        client_send_raise((uint32_t)raise_value);
-        raised_value_string.count = 0;
+     menu_set_padding(50);
+     menu_set_top_margin(100);
+
+     if (client_state.state == CLIENT_STATE_PLAYING) {
+      uint32_t p_id = client_state.player_order[client_state.player_order_index];
+      
+      if (p_id == client_state.player_id) {
+       char *call_button_text = 0;
+       if (client_state.highest_bet == 0) {
+        call_button_text = "Check";
+       } else {
+        call_button_text = tprintf(&frame_pool, "Call (Pay %d)", client_state.highest_bet - client_state.players[p_id].highest_bet);
+       }
+
+       uint8_t letter_hit = false;
+       
+       if (menu_button(call_button_text) || IsKeyPressed(KEY_C)) {
+        client_send_call();
+        letter_hit = true;
+       }
+       
+       if (menu_button("Fold") || IsKeyPressed(KEY_F)) {
+        client_send_fold();
+        letter_hit = true;
+       }
+
+       if (!letter_hit) {
+        menu_input(&raised_value_string, NUMBER_INPUT_MAX_SIZE);
+       }
+
+       if (menu_button("Raise") || IsKeyPressed(KEY_ENTER)) {
+        int64_t raise_value;
+        if (string_to_int(raised_value_string, &raise_value) &&
+            raise_value > 0 && raise_value <= MAX_RAISE)
+        {
+         client_send_raise((uint32_t)raise_value);
+         raised_value_string.count = 0;
+        }
        }
       }
      }
 
-     if (menu_button("Back")) {
+     if (menu_button("Disconnect")) {
       gui_state = GUI_MAIN_MENU;
       disconnect();
      }
-    } else { // CLIENT_STATE_WATCHING
-     menu_label("Waiting...", GREEN);
-    }
-
-    menu_end();
-   } break;
-   case CLIENT_STATE_GAME_OVER_FORFEIT: 
-   case CLIENT_STATE_GAME_OVER_WIN: {
-    menu_begin();
-
-    if (client_state.state == CLIENT_STATE_GAME_OVER_FORFEIT) {
-     if (client_state.winning_player_id == client_state.player_id) {
-      menu_label(tprintf(&frame_pool, "You won, you now have %d in your account!",
-                         client_state.players[client_state.player_id].hand_balance), BLACK);
-     } else {
-      menu_label("You lost!", BLACK);
-     }
-
-     if (menu_button("Play Again")) {
-      client_reset();
-     }
-
-     menu_end();
-   } else {
-     menu_set_padding(40);
-     menu_set_top_margin(10);
-
-     for (uint32_t i = 0; i < 5; i++) {
-      menu_label(tprintf(&frame_pool, "%d %d",
-                         client_state.common_cards[i].color,
-                         client_state.common_cards[i].number), BLACK);
-     }
-
-     for (uint32_t i = 0; i < client_state.winning_players_count; i++) {
-      Player *player = &client_state.players[client_state.winning_players_ids[i]];
-      Card *cards = player->cards;
-                                         
-      menu_label(tprintf(&frame_pool, STR_FMT_LIT" : %d %d | %d %d (added: %d)",
-                         STR_FMT(player->name), 
-                         cards[0].color, cards[0].number,
-                         cards[1].color, cards[1].number,
-                         (int32_t)player->hand_balance - (int32_t)player->balance), 
-      BLACK);
-     }
-                                 
-     if (menu_button("Play Again")) {
-      client_reset();
-     }
-    }
-
-    if (client_state.flags & CLIENT_PLAYER_DEAD) {
-     menu_label("Player died, updating global scores:", RED);
      
-     uint32_t sorted_players[MAX_PLAYERS_COUNT];
-     uint32_t sorted_players_count = 0;
+     menu_end();
 
+     // Scoreboard
+     uint32_t scoreboard_players_count = 0;
+     
      for (uint32_t p_id = 1; p_id < client_state.players_count; p_id++) {
-      if (client_state.players[p_id].flags & P_EXISTS) {
-       sorted_players[sorted_players_count++] = p_id;
+      Player *p = &client_state.players[p_id];
+      if (p->flags & P_EXISTS) {
+       scoreboard_players_count++;
       }
      }
 
-     SORT(sorted_players, sorted_players_count, client_state.players, global_score, false);
+     // int scoreboard_frame_height = scoreboard_players_count * (ITEMS_TEXT_HEIGHT + 10);
+     menu_begin_framed(0, 0, 300, 0);
 
-     for (uint32_t i = 0; i < sorted_players_count; i++) {
-      Player *p = &client_state.players[sorted_players[i]];
+     menu_set_top_margin(20);
+     menu_set_padding(ITEMS_TEXT_HEIGHT);
 
-      menu_label(tprintf(&frame_pool, STR_FMT_LIT" %d",
-                         STR_FMT(p->name), p->global_score),
-                 BLACK);
+     static uint8_t scores_shown = false;
+
+     if (scores_shown) {
+      if (menu_button("Hide scores")) scores_shown = false;
+     } else {
+      if (menu_button("Show scores")) scores_shown = true;
      }
+     
+     if (scores_shown) {
+      struct {
+       int32_t live_score;
+      } players_scores[MAX_PLAYERS_COUNT];
+
+      uint32_t players[MAX_PLAYERS_COUNT];
+      uint32_t players_count = 0;
+      
+      for (uint32_t p_id = 1; p_id < client_state.players_count; p_id++) {
+       Player *p = &client_state.players[p_id];
+       if (p->flags & P_EXISTS) {
+        players_scores[p_id].live_score = p->global_score + (p->hand_balance - PLAYER_DEFAULT_BALANCE);
+        players[players_count++] = p_id;
+       }
+      }
+
+      SORT(players, players_count, players_scores, live_score, false);
+      
+      for (uint32_t i = 0; i < players_count; i++) {
+       uint32_t p_id = players[i];
+       Player *p = &client_state.players[p_id];
+       menu_label(tprintf(&frame_pool, STR_FMT_LIT": %d", STR_FMT(p->name), players_scores[p_id]));
+      }
+     }
+     
+     menu_end();
+    }
+   } break;
+   case CLIENT_STATE_GAME_OVER_FORFEIT: {
+    menu_begin();
+
+    if (client_state.winning_player_id == client_state.player_id) {
+     menu_label(tprintf(&frame_pool, "You won, you now have %d in your account!",
+                        client_state.players[client_state.player_id].hand_balance));
+    } else {
+     menu_label("You lost!");
+    }
+
+    if (menu_button("Play Again") || IsKeyPressed(KEY_ENTER)) {
+     client_reset();
     }
 
     menu_end();

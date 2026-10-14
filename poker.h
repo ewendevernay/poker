@@ -14,14 +14,14 @@
 typedef struct PkSock PkSock;
 
 typedef struct {
-	uint8_t ip[4];
-	uint16_t port;
+ uint8_t ip[4];
+ uint16_t port;
 } PkAddr;
 
 typedef enum {
-	R_ERROR = 0,
-	R_READY,
-	R_WAIT
+ R_ERROR = 0,
+ R_READY,
+ R_WAIT
 } NBResult;
 
 static bool8_t initialize_networking();
